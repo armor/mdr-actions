@@ -2,14 +2,16 @@ name: Update Source Reference
 
 # Reusable port of pipeline-library's update-source-reference.yml: after a
 # package release, rewrite the package's `?ref=` pins in the target repo
-# (default: infrastructure-modules). Minor/patch bumps push directly to the
-# default branch as GPG-signed bot commits; major bumps go via a feature
+# (default: mdr-infrastructure-modules). Minor/patch bumps push directly to
+# the default branch as SSH-signed bot commits; major bumps go via a feature
 # branch + PR for human review.
 #
-# Hardening carried from the TRU-327/342 security review: strict-semver guard
-# on the tag-derived version, no shell tracing (consumers are public repos
-# with world-readable logs), least-privilege GITHUB_TOKEN (all pushes
-# authenticate via GIT_TOKEN_BASIC / SSH).
+# Bot identity follows the armor convention: commits are signed with the CI
+# bot's SSH key (git gpg.format=ssh) and pushed over HTTPS with the bot's
+# token — no GPG keyring, no SSH transport. Hardening carried from the
+# TRU-327/342 security review: strict-semver guard on the tag-derived
+# version, no shell tracing (consumers are public repos with world-readable
+# logs), least-privilege GITHUB_TOKEN.
 
 on:
   workflow_call:
@@ -33,24 +35,20 @@ on:
         required: false
         type: string
         default: master
-      gpg_key_id:
-        description: Fingerprint of the CI bot signing key.
+      committer_name:
+        description: Committer name for the bot commits.
         required: false
         type: string
-        default: 5DEFE5F42550F28A17F9B83AC7E6D88B99BC6D9D
-      gpg_key_subject:
-        description: Committer email matching the signing key.
+        default: mdr-autodeploy-dev
+      committer_email:
+        description: Committer email for the bot commits (must be verified on the bot account for the Verified badge).
         required: false
         type: string
-        default: ci@quantum.security
+        default: mdr-autodeploy-dev@armor.com
     secrets:
       GIT_TOKEN_BASIC:
         required: true
-      IMPORT_GPG_KEY:
-        required: true
-      IMPORT_GPG_KEY_PASSPHRASE:
-        required: true
-      QUANTUM_CI_BOT_GITHUB_SSH_KEY:
+      CI_BOT_SSH_KEY:
         required: true
 
 jobs:
@@ -62,7 +60,8 @@ jobs:
       TARGET_REPOSITORY: ${{ inputs.target_repository }}
       SOURCE_ORG: ${{ inputs.source_org }}
       DEFAULT_BRANCH: ${{ inputs.default_branch }}
-      GPG_KEY_SUBJECT: ${{ inputs.gpg_key_subject }}
+      COMMITTER_NAME: ${{ inputs.committer_name }}
+      COMMITTER_EMAIL: ${{ inputs.committer_email }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -99,27 +98,18 @@ jobs:
           echo "LATEST_VERSION=$LATEST_VERSION" >> "$GITHUB_ENV"
           echo "VERSION_CHANGED=$VERSION_CHANGED" >> "$GITHUB_ENV"
 
-      - name: Import GPG key
+      - name: Configure SSH commit signing
         env:
-          GPG_KEY_BASE64: ${{ secrets.IMPORT_GPG_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.IMPORT_GPG_KEY_PASSPHRASE }}
-          GPG_KEY_ID: ${{ inputs.gpg_key_id }}
-        run: |
-          echo "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
-          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient "$GPG_KEY_SUBJECT" > temp.encrypted
-          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
-          rm -f temp.encrypted
-          git config --global user.signingkey "$GPG_KEY_ID"
-          git config --global commit.gpgsign true
-
-      - name: Setup SSH key
-        env:
-          SSH_KEY: ${{ secrets.QUANTUM_CI_BOT_GITHUB_SSH_KEY }}
+          SSH_SIGNING_KEY: ${{ secrets.CI_BOT_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          echo "$SSH_SIGNING_KEY" > ~/.ssh/signing_key
+          chmod 600 ~/.ssh/signing_key
+          git config --global gpg.format ssh
+          git config --global user.signingkey ~/.ssh/signing_key
+          git config --global commit.gpgsign true
+          git config --global user.name "$COMMITTER_NAME"
+          git config --global user.email "$COMMITTER_EMAIL"
 
       - name: Update source references
         env:
@@ -129,9 +119,7 @@ jobs:
           # No shell tracing: consumers are public repos, so Actions logs are
           # world-readable — keep output to the deliberate echoes only.
           set -e
-          git config --global user.email "$GPG_KEY_SUBJECT"
-          git config --global user.name "Quantum CI Bot"
-          git clone "git@github.com:${SOURCE_ORG}/${TARGET_REPOSITORY}.git"
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${SOURCE_ORG}/${TARGET_REPOSITORY}.git"
           pushd "./${TARGET_REPOSITORY}"
           IFS='.' read -r -a current <<< "$LATEST_VERSION"
           current_major="${current[0]}"

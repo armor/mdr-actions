@@ -42,6 +42,16 @@ on:
         required: false
         type: string
         default: master
+      committer_name:
+        description: Committer name for the import commits.
+        required: false
+        type: string
+        default: mdr-autodeploy-dev
+      committer_email:
+        description: Committer email for the import commits.
+        required: false
+        type: string
+        default: mdr-autodeploy-dev@armor.com
     secrets:
       GIT_TOKEN_BASIC:
         required: true
@@ -252,8 +262,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          git config user.email "ci@quantum.security"
-          git config user.name "Quantum CI Bot"
+          git config user.email "${{ inputs.committer_email }}"
+          git config user.name "${{ inputs.committer_name }}"
 
           # Check if there are actual changes to commit
           git add "$DESTINATION"

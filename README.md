@@ -10,7 +10,7 @@ Reusable GitHub workflows shared by Quantum repositories.
 | `terragrunt-validation.yaml` | Pre-commit for terragrunt-based repos; optional `changed_files_only` mode. |
 | `strict-yaml-validation.yaml` | Strict YAML scan of a directory (duplicate keys rejected). |
 | `semantic-release.yaml` | Runs semantic-release on the consumer's release stack; outputs `semver` (empty when no release was created). Optional `release_artifact` input downloads a same-run workflow artifact before releasing. |
-| `update-source-reference.yaml` | After a package release, rewrite the package's `?ref=` pins in a target repository. Minor/patch → direct push; major → feature branch + PR. |
+| `update-source-reference.yaml` | After a package release, rewrite the package's `?ref=` pins in a target repository. Minor/patch → direct SSH-signed push; major → feature branch + PR. |
 | `import-release-content.yaml` | Import a release asset: download, validate everything it adds or changes, update the version pointer and changelog, commit. |
 | `copy-source-to-repo.yaml` | Sync the paths in a path-list file into a mirror repository and tag the version. |
 | `repository-dispatch.yaml` | Send a version-carrying `repository_dispatch` event to a downstream repository. |
