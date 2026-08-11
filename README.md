@@ -34,14 +34,14 @@ Pin by tag, never a branch. Two conventions depending on the workflow:
 ```yaml
 jobs:
   validation:
-    uses: quantum-sec/actions/.github/workflows/terraform-module-validation.yaml@v1
+    uses: armor/mdr-actions/.github/workflows/terraform-module-validation.yaml@v1
 
   release:
     needs: validation
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     permissions:
       contents: write
-    uses: quantum-sec/actions/.github/workflows/semantic-release.yaml@v1.4.0
+    uses: armor/mdr-actions/.github/workflows/semantic-release.yaml@v1.4.0
     secrets:
       GIT_TOKEN_BASIC: ${{ secrets.GIT_TOKEN_BASIC }}
 ```

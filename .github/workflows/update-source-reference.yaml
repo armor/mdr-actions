@@ -22,12 +22,12 @@ on:
         description: Repository whose sources are updated.
         required: false
         type: string
-        default: infrastructure-modules
+        default: mdr-infrastructure-modules
       source_org:
         description: GitHub organization hosting the target repository.
         required: false
         type: string
-        default: quantum-sec
+        default: armor
       default_branch:
         description: Branch that minor/patch updates are pushed to directly.
         required: false

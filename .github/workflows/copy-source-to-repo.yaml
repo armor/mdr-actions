@@ -18,7 +18,7 @@ on:
         description: GitHub organization hosting the target repository.
         required: false
         type: string
-        default: quantum-sec
+        default: armor
       path_list_file:
         description: File listing the paths to sync (one per line).
         required: false
