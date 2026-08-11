@@ -3,7 +3,8 @@ name: Copy Source To Repo
 # Reusable sync-to-mirror job (port of pipeline-library's
 # copy-source-to-repo.yml / infrastructure-modules' sync-customer-modules):
 # rsync the paths listed in a path-list file into a target repository,
-# commit as the CI bot (GPG-signed), tag with the given version, and push.
+# commit as the CI bot (SSH-signed, per the armor bot convention), tag with
+# the given version, and push over HTTPS with the bot's token.
 # Content synced by this workflow should be validated in the SOURCE repo
 # before release — the mirror receives it as-is.
 
@@ -33,22 +34,20 @@ on:
         required: false
         type: string
         default: ''
-      gpg_key_id:
-        description: Fingerprint of the CI bot signing key.
+      committer_name:
+        description: Committer name for the bot commits.
         required: false
         type: string
-        default: 5DEFE5F42550F28A17F9B83AC7E6D88B99BC6D9D
-      gpg_key_subject:
-        description: Committer email matching the signing key.
+        default: mdr-autodeploy-dev
+      committer_email:
+        description: Committer email for the bot commits (must be verified on the bot account for the Verified badge).
         required: false
         type: string
-        default: ci@quantum.security
+        default: mdr-autodeploy-dev@armor.com
     secrets:
-      IMPORT_GPG_KEY:
+      GIT_TOKEN_BASIC:
         required: true
-      IMPORT_GPG_KEY_PASSPHRASE:
-        required: true
-      QUANTUM_CI_BOT_GITHUB_SSH_KEY:
+      CI_BOT_SSH_KEY:
         required: true
 
 jobs:
@@ -60,7 +59,8 @@ jobs:
       SOURCE_ORG: ${{ inputs.source_org }}
       PATH_LIST_FILE: ${{ inputs.path_list_file }}
       SYNC_VERSION: ${{ inputs.version }}
-      GPG_KEY_SUBJECT: ${{ inputs.gpg_key_subject }}
+      COMMITTER_NAME: ${{ inputs.committer_name }}
+      COMMITTER_EMAIL: ${{ inputs.committer_email }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,30 +72,23 @@ jobs:
             exit 1
           fi
 
-      - name: Import GPG key
+      - name: Configure SSH commit signing
         env:
-          GPG_KEY_BASE64: ${{ secrets.IMPORT_GPG_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.IMPORT_GPG_KEY_PASSPHRASE }}
-          GPG_KEY_ID: ${{ inputs.gpg_key_id }}
-        run: |
-          echo "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
-          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient "$GPG_KEY_SUBJECT" > temp.encrypted
-          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
-          rm -f temp.encrypted
-          git config --global user.signingkey "$GPG_KEY_ID"
-          git config --global commit.gpgsign true
-
-      - name: Setup SSH key
-        env:
-          SSH_KEY: ${{ secrets.QUANTUM_CI_BOT_GITHUB_SSH_KEY }}
+          SSH_SIGNING_KEY: ${{ secrets.CI_BOT_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          echo "$SSH_SIGNING_KEY" > ~/.ssh/signing_key
+          chmod 600 ~/.ssh/signing_key
+          git config --global gpg.format ssh
+          git config --global user.signingkey ~/.ssh/signing_key
+          git config --global commit.gpgsign true
+          git config --global user.name "$COMMITTER_NAME"
+          git config --global user.email "$COMMITTER_EMAIL"
 
       - name: Clone target repository
-        run: git clone "git@github.com:${SOURCE_ORG}/${TARGET_REPOSITORY}.git"
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
+        run: git clone "https://x-access-token:${GIT_TOKEN}@github.com/${SOURCE_ORG}/${TARGET_REPOSITORY}.git"
 
       - name: Sync paths
         run: |
@@ -109,8 +102,6 @@ jobs:
           COMMIT_MESSAGE: ${{ inputs.commit_message }}
         run: |
           cd "$TARGET_REPOSITORY"
-          git config user.email "$GPG_KEY_SUBJECT"
-          git config user.name "Quantum CI Bot"
           MESSAGE="${COMMIT_MESSAGE:-Import updates from ${GITHUB_REPOSITORY#*/}@${SYNC_VERSION} (patch)}"
           git add -A
           git commit --allow-empty -m "$MESSAGE"
