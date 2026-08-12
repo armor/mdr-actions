@@ -157,6 +157,16 @@ jobs:
             fi
           else
             echo "Major version was not changed, merging to ${DEFAULT_BRANCH}"
-            git push origin "$DEFAULT_BRANCH"
+            # Concurrent package releases race on this push (no shared lock across
+            # repos) — rebase and retry instead of failing on non-fast-forward.
+            for attempt in 1 2 3; do
+              if git push origin "$DEFAULT_BRANCH"; then
+                break
+              fi
+              echo "Push rejected (attempt $attempt) — rebasing onto latest $DEFAULT_BRANCH"
+              git fetch origin "$DEFAULT_BRANCH"
+              git rebase "origin/$DEFAULT_BRANCH"
+              [ "$attempt" = "3" ] && { echo "::error::Push failed after 3 attempts"; exit 1; }
+            done
           fi
           popd
