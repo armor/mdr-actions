@@ -46,12 +46,12 @@ on:
         description: Committer name for the import commits.
         required: false
         type: string
-        default: mdr-autodeploy-dev
+        default: armorsa
       committer_email:
         description: Committer email for the import commits.
         required: false
         type: string
-        default: mdr-autodeploy-dev@armor.com
+        default: ci@armor.com
     secrets:
       GIT_TOKEN_BASIC:
         required: true
