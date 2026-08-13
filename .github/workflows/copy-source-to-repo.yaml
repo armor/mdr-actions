@@ -3,7 +3,7 @@ name: Copy Source To Repo
 # Reusable sync-to-mirror job (port of pipeline-library's
 # copy-source-to-repo.yml / infrastructure-modules' sync-customer-modules):
 # rsync the paths listed in a path-list file into a target repository,
-# commit as the CI bot (SSH-signed, per the armor bot convention), tag with
+# commit as the CI bot (GPG-signed with the armorsa CI bot kit), tag with
 # the given version, and push over HTTPS with the bot's token.
 # Content synced by this workflow should be validated in the SOURCE repo
 # before release — the mirror receives it as-is.
@@ -38,16 +38,17 @@ on:
         description: Committer name for the bot commits.
         required: false
         type: string
-        default: mdr-autodeploy-dev
-      committer_email:
-        description: Committer email for the bot commits (must be verified on the bot account for the Verified badge).
-        required: false
-        type: string
-        default: mdr-autodeploy-dev@armor.com
+        default: armorsa
     secrets:
       GIT_TOKEN_BASIC:
         required: true
-      CI_BOT_SSH_KEY:
+      CI_BOT_GPG_KEY:
+        required: true
+      CI_BOT_GPG_KEY_ID:
+        required: true
+      CI_BOT_GPG_KEY_PASSPHRASE:
+        required: true
+      CI_BOT_GPG_KEY_SUBJECT:
         required: true
 
 jobs:
@@ -60,7 +61,6 @@ jobs:
       PATH_LIST_FILE: ${{ inputs.path_list_file }}
       SYNC_VERSION: ${{ inputs.version }}
       COMMITTER_NAME: ${{ inputs.committer_name }}
-      COMMITTER_EMAIL: ${{ inputs.committer_email }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,18 +72,23 @@ jobs:
             exit 1
           fi
 
-      - name: Configure SSH commit signing
+      - name: Import GPG signing key
+        # The armorsa CI bot kit: key registered on the armorsa account, so
+        # commits verify. Proven flow carried from the v1 workflows.
         env:
-          SSH_SIGNING_KEY: ${{ secrets.CI_BOT_SSH_KEY }}
+          GPG_KEY_BASE64: ${{ secrets.CI_BOT_GPG_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.CI_BOT_GPG_KEY_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.CI_BOT_GPG_KEY_ID }}
+          GPG_KEY_SUBJECT: ${{ secrets.CI_BOT_GPG_KEY_SUBJECT }}
         run: |
-          mkdir -p ~/.ssh
-          echo "$SSH_SIGNING_KEY" > ~/.ssh/signing_key
-          chmod 600 ~/.ssh/signing_key
-          git config --global gpg.format ssh
-          git config --global user.signingkey ~/.ssh/signing_key
+          echo "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
+          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient "$GPG_KEY_SUBJECT" > temp.encrypted
+          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
+          rm -f temp.encrypted
+          git config --global user.signingkey "$GPG_KEY_ID"
           git config --global commit.gpgsign true
           git config --global user.name "$COMMITTER_NAME"
-          git config --global user.email "$COMMITTER_EMAIL"
+          git config --global user.email "$GPG_KEY_SUBJECT"
 
       - name: Clone target repository
         env:
