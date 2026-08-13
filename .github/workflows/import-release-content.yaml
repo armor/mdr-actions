@@ -55,6 +55,14 @@ on:
     secrets:
       GIT_TOKEN_BASIC:
         required: true
+      CI_BOT_GPG_KEY:
+        required: false
+      CI_BOT_GPG_KEY_ID:
+        required: false
+      CI_BOT_GPG_KEY_PASSPHRASE:
+        required: false
+      CI_BOT_GPG_KEY_SUBJECT:
+        required: false
 
 jobs:
   import:
@@ -261,9 +269,25 @@ jobs:
         if: steps.release.outputs.skip != 'true'
         env:
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          GPG_KEY: ${{ secrets.CI_BOT_GPG_KEY }}
+          GPG_KEY_ID: ${{ secrets.CI_BOT_GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.CI_BOT_GPG_KEY_PASSPHRASE }}
+          GPG_SUBJECT: ${{ secrets.CI_BOT_GPG_KEY_SUBJECT }}
         run: |
           git config user.email "${{ inputs.committer_email }}"
           git config user.name "${{ inputs.committer_name }}"
+          # Sign when the CI bot GPG kit is provided (optional for
+          # backwards compatibility; unsigned otherwise).
+          if [ -n "$GPG_KEY" ]; then
+            if ! printf '%s\n' "$GPG_KEY" | gpg --batch --yes --no-tty --always-trust --import; then
+              printf '%s\n' "$GPG_KEY" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
+            fi
+            echo "SIGN_TEST" | gpg --always-trust --encrypt --recipient "$GPG_SUBJECT" > temp.encrypted
+            gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
+            rm -f temp.encrypted
+            git config user.signingkey "$GPG_KEY_ID"
+            git config commit.gpgsign true
+          fi
 
           # Check if there are actual changes to commit
           git add "$DESTINATION"
