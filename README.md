@@ -14,6 +14,8 @@ Reusable GitHub workflows shared by Quantum repositories.
 | `import-release-content.yaml` | Import a release asset: download, validate everything it adds or changes, update the version pointer and changelog, commit. |
 | `copy-source-to-repo.yaml` | Sync the paths in a path-list file into a mirror repository and tag the version. |
 | `repository-dispatch.yaml` | Send a version-carrying `repository_dispatch` event to a downstream repository. |
+| `bump-version-pin.yaml` | Promote a content-only release: bump a pin key in the caller's versions file on a bot branch, open a PR with generated release notes, optionally enable auto-merge. One open bump PR at a time. |
+| `merge-upstream.yaml` | Merge an upstream repository's default branch into the caller's with the standard release subject and notes; push directly or open a PR; excluded paths stay as-is; conflicts fall back to a PR. |
 
 Single-consumer automation deliberately stays in its own repository —
 centralizing a one-off adds indirection without reuse.
