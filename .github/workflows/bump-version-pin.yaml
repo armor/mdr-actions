@@ -1,9 +1,11 @@
 name: Bump Version Pin
 
-# Reusable content-promotion step (TRU-390): when the source repository has
-# released a version whose diff is confined to content paths, bump the
-# pin key in the caller's versions file on a bot branch, open a pull
-# request with generated release notes and, optionally, enable auto-merge.
+# Reusable content-promotion step (TRU-390): when the mirror repository the
+# caller deploys from has a new tag whose diff is confined to content paths,
+# bump the pin key in the caller's versions file on a bot branch, open a
+# pull request with generated release notes and, optionally, enable
+# auto-merge. The diff is taken on the mirror because that is all the caller
+# can deploy; the source repository is only read for its release notes.
 #
 # One PR at a time: if a bot bump PR is already open this run exits
 # without touching it, so an in-flight regression is never restarted and a
@@ -19,11 +21,11 @@ on:
   workflow_call:
     inputs:
       source_repository:
-        description: Repository whose releases are promoted (org/name). Its diff decides content-only.
+        description: Repository whose GitHub releases supply the PR notes (org/name); it shares version numbers with the mirror.
         required: true
         type: string
       mirror_repository:
-        description: Repository the caller actually deploys from (org/name). The version must be tagged there.
+        description: Repository the caller deploys from (org/name). The version must be tagged there and its diff decides content-only.
         required: true
         type: string
       version:
@@ -179,17 +181,17 @@ jobs:
             decide pr-open "A bump PR is already open: ${OPEN_PR}. It is left untouched; this version is picked up after it merges."; exit 0
           fi
 
-          # Content-only check on the SOURCE repository (not the mirror, which
-          # omits paths that may still have changed).
+          # Content-only check on the MIRROR: it holds exactly what the caller
+          # can deploy, so a change the mirror never receives cannot matter here.
           git clone --quiet --filter=blob:none --no-checkout \
-            "https://x-access-token:${GH_TOKEN}@github.com/${SOURCE_REPOSITORY}.git" /tmp/source
+            "https://x-access-token:${GH_TOKEN}@github.com/${MIRROR_REPOSITORY}.git" /tmp/mirror
           RANGE="${CURRENT}..${VERSION}"
           for tag in "$CURRENT" "$VERSION"; do
-            git -C /tmp/source rev-parse -q --verify "refs/tags/${tag}" >/dev/null \
-              || { echo "::error::${tag} is not a tag in ${SOURCE_REPOSITORY}"; exit 1; }
+            git -C /tmp/mirror rev-parse -q --verify "refs/tags/${tag}" >/dev/null \
+              || { echo "::error::${tag} is not a tag in ${MIRROR_REPOSITORY}"; exit 1; }
           done
-          git -C /tmp/source diff --name-only --no-renames "$RANGE" > /tmp/changed-files.txt
-          echo "$(wc -l < /tmp/changed-files.txt | tr -d ' ') files changed in ${SOURCE_REPOSITORY} ${RANGE}"
+          git -C /tmp/mirror diff --name-only --no-renames "$RANGE" > /tmp/changed-files.txt
+          echo "$(wc -l < /tmp/changed-files.txt | tr -d ' ') files changed in ${MIRROR_REPOSITORY} ${RANGE}"
 
           : > /tmp/outside.txt
           while IFS= read -r file; do
@@ -203,7 +205,7 @@ jobs:
           done < /tmp/changed-files.txt
 
           if [ -s /tmp/outside.txt ]; then
-            decide not-content-only "${SOURCE_REPOSITORY} ${RANGE} changes files outside the content paths; a person must open the usual ${FLOOR_KEY} PR." \
+            decide not-content-only "${MIRROR_REPOSITORY} ${RANGE} changes files outside the content paths; a person must open the usual ${FLOOR_KEY} PR." \
               "" '~~~' "$(head -n 50 /tmp/outside.txt)" '~~~'
             echo "::warning::${VERSION} is not content-only; not promoted."
             exit 0
@@ -254,20 +256,28 @@ jobs:
           {
             echo "Release Notes:"
             echo
-            # One entry per source commit in the range. Library imports are expanded
-            # with that library release's own notes so JIRA keys and rule names survive.
-            # Notes are best effort: nothing here may fail the step, since the
-            # branch is already pushed and a failure would leave it without a PR.
-            git -C /tmp/source log --reverse --format='%s' "${CURRENT}..${VERSION}" | while IFS= read -r subject; do
-              if [[ "$subject" =~ ^Import\ content\ updates\ from\ ([^@]+)@([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                lib="${BASH_REMATCH[1]}"; ver="${BASH_REMATCH[2]}"
-                echo "- ${lib#*/} ${ver}"
-                gh release view "$ver" --repo "$lib" --json body --jq '.body' 2>/dev/null | sed -e '/^[[:space:]]*$/d' -e 's/^/    /' \
-                  || echo "    (release notes for ${lib}@${ver} unavailable)"
-              else
-                echo "- ${subject}"
-              fi
-            done || echo "- (commit list for ${CURRENT}..${VERSION} unavailable)"
+            # One entry per source release in the range, taken from its GitHub
+            # release body (semantic-release writes it with JIRA links). The mirror
+            # and the source share version numbers, so the mirror's tags give the
+            # list. Library imports are expanded with that library release's own
+            # notes so rule names survive. Notes are best effort: nothing here may
+            # fail the step, since the branch is already pushed and a failure
+            # would leave it without a PR.
+            git -C /tmp/mirror tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V \
+              | awk -v lo="$CURRENT" -v hi="$VERSION" '$0 == lo { f = 1; next } f { print } $0 == hi { exit }' \
+              | while IFS= read -r ver; do
+              echo "- ${SOURCE_REPOSITORY#*/} ${ver}"
+              BODY="$(gh release view "$ver" --repo "$SOURCE_REPOSITORY" --json body --jq '.body' 2>/dev/null || true)"
+              if [ -z "$BODY" ]; then echo "    (release notes for ${SOURCE_REPOSITORY}@${ver} unavailable)"; continue; fi
+              printf '%s\n' "$BODY" | sed -e '/^[[:space:]]*$/d' -e '/^#/d' -e 's/^\* /- /' | while IFS= read -r line; do
+                echo "    ${line}"
+                if [[ "$line" =~ Import\ content\ updates\ from\ ([^@[:space:]]+)@([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                  lib="${BASH_REMATCH[1]}"; lv="${BASH_REMATCH[2]}"
+                  gh release view "$lv" --repo "$lib" --json body --jq '.body' 2>/dev/null | sed -e '/^[[:space:]]*$/d' -e 's/^/        /' \
+                    || echo "        (release notes for ${lib}@${lv} unavailable)"
+                fi
+              done
+            done || echo "- (release list for ${CURRENT}..${VERSION} unavailable)"
             echo
             echo "Compare: https://github.com/${SOURCE_REPOSITORY}/compare/${RANGE}"
           } > /tmp/pr-body.md
