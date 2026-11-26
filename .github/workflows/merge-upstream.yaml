@@ -3,8 +3,10 @@ name: Merge Upstream
 # Reusable downstream-sync step (TRU-390): merge the upstream repository's
 # default branch into the caller's, with the standard release commit
 # subject "Infrastructure-modules version <global_ref> & content
-# <xdr-content>" and generated release notes, then either push the merge
-# to the default branch directly or open a pull request.
+# <xdr-content>" and no body (the subject is what the caller's release
+# notes are generated from), then either push the merge to the default
+# branch directly or open a pull request whose body carries debugging
+# pointers only.
 #
 # Two guards:
 # - direct_push applies only when the merge changes nothing but the
@@ -38,7 +40,7 @@ on:
         type: string
         default: azure/.template/versions.json
       modules_repository:
-        description: Repository whose commits between the old and new xdr-content pins form the release notes.
+        description: Repository whose compare link between the old and new xdr-content pins goes in the PR body.
         required: false
         type: string
         default: armor/mdr-infrastructure-modules
@@ -150,7 +152,7 @@ jobs:
             echo "new_xdr_content=$(pin "upstream/${UPSTREAM_BRANCH}" xdr-content)"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compose release notes
+      - name: Compose subject and pointers
         id: notes
         if: steps.upstream.outputs.up_to_date != 'true'
         env:
@@ -161,31 +163,20 @@ jobs:
         run: |
           SUBJECT="Infrastructure-modules version ${NEW_GLOBAL_REF} & content ${NEW_XDR_CONTENT}"
           echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+          # Pointers for a PR body, used only when a person has to look: the
+          # upstream range, the content range and this run. No prose; the
+          # commit itself carries the subject only.
           {
-            echo "Release Notes:"
-            # Notes are best effort: they must never block the sync itself.
+            echo "- Upstream: https://github.com/${UPSTREAM_REPOSITORY}/compare/$(git rev-parse --short HEAD)...$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
             if [ -n "$OLD_XDR_CONTENT" ] && [ "$OLD_XDR_CONTENT" != "$NEW_XDR_CONTENT" ]; then
-              if git clone --quiet --filter=blob:none --no-checkout \
-                  "https://x-access-token:${GH_TOKEN}@github.com/${MODULES_REPOSITORY}.git" /tmp/modules 2>/dev/null; then
-                git -C /tmp/modules log --reverse --format='%s' "${OLD_XDR_CONTENT}..${NEW_XDR_CONTENT}" 2>/dev/null | while IFS= read -r subject; do
-                  if [[ "$subject" =~ ^Import\ content\ updates\ from\ ([^@]+)@([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-                    echo "- ${BASH_REMATCH[1]#*/} ${BASH_REMATCH[2]}"
-                  else
-                    echo "- ${subject}"
-                  fi
-                done || echo "- Content ${OLD_XDR_CONTENT} to ${NEW_XDR_CONTENT} (commit list unavailable)"
-              else
-                echo "- Content ${OLD_XDR_CONTENT} to ${NEW_XDR_CONTENT}"
-              fi
+              echo "- Content ${OLD_XDR_CONTENT} → ${NEW_XDR_CONTENT}: https://github.com/${MODULES_REPOSITORY}/compare/${OLD_XDR_CONTENT}...${NEW_XDR_CONTENT}"
             fi
             if [ "$OLD_GLOBAL_REF" != "$NEW_GLOBAL_REF" ]; then
-              echo "- Infrastructure modules ${OLD_GLOBAL_REF} to ${NEW_GLOBAL_REF}"
+              echo "- Modules ${OLD_GLOBAL_REF} → ${NEW_GLOBAL_REF}: https://github.com/${MODULES_REPOSITORY}/compare/${OLD_GLOBAL_REF}...${NEW_GLOBAL_REF}"
             fi
-            # Non-pin changes merged from upstream (template edits), by subject.
-            git log --reverse --no-merges --format='%s' "HEAD..upstream/${UPSTREAM_BRANCH}" -- . ":(exclude)${PIN_FILE}" \
-              | grep -v -E "(^|: )Bump ${DIRECT_PUSH_KEY} to " | sed 's/^/- /' || true
-          } > /tmp/release-notes.md
-          cat /tmp/release-notes.md
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/pointers.md
+          cat /tmp/pointers.md
 
       - name: Merge
         id: merge
@@ -229,22 +220,11 @@ jobs:
             printf 'Conflicts:\n~~~\n%s\n~~~\n' "$CONFLICTS" | tee -a "$GITHUB_STEP_SUMMARY"
             printf '%s\n' "$CONFLICTS" > /tmp/conflicts.txt
             git add -A
-            git commit --no-verify -F - <<EOM
-          ${SUBJECT}
-
-          $(cat /tmp/release-notes.md)
-
-          CONFLICTS TO RESOLVE:
-          $(sed 's/^/- /' /tmp/conflicts.txt)
-          EOM
+            git commit --no-verify -m "$SUBJECT"
             exit 0
           fi
           echo "conflict=false" >> "$GITHUB_OUTPUT"
-          git commit -F - <<EOM
-          ${SUBJECT}
-
-          $(cat /tmp/release-notes.md)
-          EOM
+          git commit -m "$SUBJECT"
 
           # Inclusion guard: only a merge that changes the pin key alone may be
           # pushed without a person. Everything else is reviewed.
@@ -284,18 +264,18 @@ jobs:
             git checkout -b "$BRANCH"
             git push origin "$BRANCH"
             {
-              cat /tmp/release-notes.md
-              echo
               echo "Automatic merge of upstream/${UPSTREAM_BRANCH} hit conflicts. The merge commit on this branch contains the conflict markers; resolve them in a follow-up commit on this branch, then merge. Validation fails until the markers are gone."
               echo
               echo "Files with conflicts:"
               sed 's/^/- /' /tmp/conflicts.txt
+              echo
+              cat /tmp/pointers.md
             } > /tmp/pr-body.md
             RESULT=conflict-pr-opened
           else
             git checkout -b "$BRANCH"
             git push origin "$BRANCH"
-            cp /tmp/release-notes.md /tmp/pr-body.md
+            cp /tmp/pointers.md /tmp/pr-body.md
             RESULT=pr-opened
             if [ "$DIRECT_PUSH" = "true" ] && [ "$PIN_ONLY" != "true" ]; then
               RESULT=not-pin-only-pr-opened
