@@ -183,7 +183,7 @@ jobs:
             fi
             # Non-pin changes merged from upstream (template edits), by subject.
             git log --reverse --no-merges --format='%s' "HEAD..upstream/${UPSTREAM_BRANCH}" -- . ":(exclude)${PIN_FILE}" \
-              | grep -v "^Bump ${DIRECT_PUSH_KEY} to " | sed 's/^/- /' || true
+              | grep -v -E "(^|: )Bump ${DIRECT_PUSH_KEY} to " | sed 's/^/- /' || true
           } > /tmp/release-notes.md
           cat /tmp/release-notes.md
 

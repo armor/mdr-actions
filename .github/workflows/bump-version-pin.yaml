@@ -77,6 +77,14 @@ on:
         required: false
         type: string
         default: armorsa
+      subject_prefix:
+        description: >-
+          Prefix for the commit subject and PR title, giving "<prefix>: Bump <pin_key> to <version>".
+          The shared changelog convention only lists commits shaped "<prefix>: <message>", so without
+          one the bump would be missing from the release notes downstream.
+        required: false
+        type: string
+        default: Content
     outputs:
       result:
         description: promoted | already-current | below-floor | capped | pr-open | not-content-only | no-current
@@ -116,6 +124,7 @@ jobs:
       DEFAULT_BRANCH: ${{ inputs.default_branch }}
       BRANCH_NAME: ${{ inputs.branch_name }}
       COMMITTER_NAME: ${{ inputs.committer_name }}
+      SUBJECT_PREFIX: ${{ inputs.subject_prefix }}
       GH_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
     steps:
       - name: Checkout
@@ -240,7 +249,7 @@ jobs:
           jq --indent 2 --arg k "$PIN_KEY" --arg v "$VERSION" '.[$k] = $v' "$PIN_FILE" > "${PIN_FILE}.tmp"
           mv "${PIN_FILE}.tmp" "$PIN_FILE"
           git add "$PIN_FILE"
-          git commit -m "Bump ${PIN_KEY} to ${VERSION}"
+          git commit -m "${SUBJECT_PREFIX}: Bump ${PIN_KEY} to ${VERSION}"
           # A stale branch from a closed PR may exist; the bump always starts from the default branch.
           git push --force origin "$BRANCH_NAME"
 
@@ -282,7 +291,7 @@ jobs:
             echo "Compare: https://github.com/${SOURCE_REPOSITORY}/compare/${RANGE}"
           } > /tmp/pr-body.md
           PR_URL="$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH_NAME" \
-            --title "Bump ${PIN_KEY} to ${VERSION}" --body-file /tmp/pr-body.md)"
+            --title "${SUBJECT_PREFIX}: Bump ${PIN_KEY} to ${VERSION}" --body-file /tmp/pr-body.md)"
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "Opened ${PR_URL}" | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$AUTO_MERGE" = "true" ]; then
