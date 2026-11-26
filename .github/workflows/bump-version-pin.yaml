@@ -1,0 +1,296 @@
+name: Bump Version Pin
+
+# Reusable content-promotion step (TRU-390): when the mirror repository the
+# caller deploys from has a new tag whose diff is confined to content paths,
+# bump the pin key in the caller's versions file on a bot branch, open a
+# pull request whose body points at the releases and, optionally, enable
+# auto-merge. The diff is taken on the mirror because that is all the caller
+# can deploy; the source repository is only read for its release notes.
+#
+# One PR at a time: if a bot bump PR is already open this run exits
+# without touching it, so an in-flight regression is never restarted and a
+# later release cannot block an earlier one. The caller re-runs this
+# workflow on pushes to its default branch, which picks up anything
+# released meanwhile.
+#
+# This workflow decides whether to OPEN a PR. Whether that PR may MERGE is
+# decided by the caller repository's required checks (the regression and a
+# bump-guard that re-verifies the same conditions from the PR's own diff).
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        description: Repository whose compare and release pages the PR body links to (org/name); it shares version numbers with the mirror.
+        required: true
+        type: string
+      mirror_repository:
+        description: Repository the caller deploys from (org/name). The version must be tagged there and its diff decides content-only.
+        required: true
+        type: string
+      version:
+        description: Version to promote; empty resolves to the newest tag in the mirror.
+        required: false
+        type: string
+        default: ''
+      pin_file:
+        description: JSON file holding the version pins.
+        required: false
+        type: string
+        default: azure/.template/versions.json
+      pin_key:
+        description: Key in pin_file that is bumped.
+        required: false
+        type: string
+        default: xdr-content
+      floor_key:
+        description: Key in pin_file the new version must not be older than.
+        required: false
+        type: string
+        default: global_ref
+      content_only_paths:
+        description: Newline-separated path prefixes; a release touching anything outside them is not promoted.
+        required: false
+        type: string
+        default: |
+          azure/content/
+      max_version:
+        description: Do not promote past this version (empty = no cap).
+        required: false
+        type: string
+        default: ''
+      auto_merge:
+        description: Enable auto-merge on the PR (merges when the caller's required checks pass).
+        required: false
+        type: boolean
+        default: false
+      default_branch:
+        required: false
+        type: string
+        default: master
+      branch_name:
+        description: Bot branch the bump is committed to.
+        required: false
+        type: string
+        default: bot/bump-xdr-content
+      committer_name:
+        required: false
+        type: string
+        default: armorsa
+      subject_prefix:
+        description: >-
+          Prefix for the commit subject and PR title, giving "<prefix>: Bump <pin_key> to <version>".
+          The shared changelog convention only lists commits shaped "<prefix>: <message>", so without
+          one the bump would be missing from the release notes downstream.
+        required: false
+        type: string
+        default: Content
+    outputs:
+      result:
+        description: promoted | already-current | below-floor | capped | pr-open | not-content-only | no-current
+        value: ${{ jobs.bump.outputs.result }}
+      version:
+        value: ${{ jobs.bump.outputs.version }}
+      pr_url:
+        value: ${{ jobs.bump.outputs.pr_url }}
+    secrets:
+      GIT_TOKEN_BASIC:
+        required: true
+      CI_BOT_GPG_KEY:
+        required: true
+      CI_BOT_GPG_KEY_ID:
+        required: true
+      CI_BOT_GPG_KEY_PASSPHRASE:
+        required: true
+      CI_BOT_GPG_KEY_SUBJECT:
+        required: true
+
+jobs:
+  bump:
+    name: Bump ${{ inputs.pin_key }}
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.decide.outputs.result }}
+      version: ${{ steps.resolve.outputs.version }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    env:
+      SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      MIRROR_REPOSITORY: ${{ inputs.mirror_repository }}
+      PIN_FILE: ${{ inputs.pin_file }}
+      PIN_KEY: ${{ inputs.pin_key }}
+      FLOOR_KEY: ${{ inputs.floor_key }}
+      CONTENT_ONLY_PATHS: ${{ inputs.content_only_paths }}
+      MAX_VERSION: ${{ inputs.max_version }}
+      DEFAULT_BRANCH: ${{ inputs.default_branch }}
+      BRANCH_NAME: ${{ inputs.branch_name }}
+      COMMITTER_NAME: ${{ inputs.committer_name }}
+      SUBJECT_PREFIX: ${{ inputs.subject_prefix }}
+      GH_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.default_branch }}
+          token: ${{ secrets.GIT_TOKEN_BASIC }}
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            # Newest semver tag in the mirror (tags are bare numbers).
+            VERSION="$(gh api "repos/${MIRROR_REPOSITORY}/git/matching-refs/tags/" --paginate --jq '.[].ref' \
+              | sed 's#^refs/tags/##' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$VERSION' is not strict semver — refusing to proceed."
+            exit 1
+          fi
+          if ! gh api "repos/${MIRROR_REPOSITORY}/git/ref/tags/${VERSION}" --silent 2>/dev/null; then
+            echo "::error::Tag ${VERSION} does not exist in ${MIRROR_REPOSITORY}; the mirror sync has not produced it."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version to promote: $VERSION"
+
+      - name: Decide
+        id: decide
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          decide() { echo "result=$1" >> "$GITHUB_OUTPUT"; echo "## Bump ${PIN_KEY}: $1" >> "$GITHUB_STEP_SUMMARY"; shift; printf '%s\n' "$@" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          # Smallest of two semvers is first in sort -V order.
+          lte() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
+
+          CURRENT="$(jq -r --arg k "$PIN_KEY" '.[$k] // empty' "$PIN_FILE")"
+          FLOOR="$(jq -r --arg k "$FLOOR_KEY" '.[$k] // empty' "$PIN_FILE")"
+          { echo "current_version=$CURRENT"; echo "floor_version=$FLOOR"; } >> "$GITHUB_OUTPUT"
+          echo "Current ${PIN_KEY}: ${CURRENT:-<unset>}   ${FLOOR_KEY}: ${FLOOR:-<unset>}"
+
+          if [ -z "$CURRENT" ]; then
+            decide no-current "${PIN_KEY} is not set in ${PIN_FILE}; the first value must be set by a person."; exit 0
+          fi
+          if lte "$VERSION" "$CURRENT"; then
+            decide already-current "${PIN_KEY} is already ${CURRENT}; nothing to do."; exit 0
+          fi
+          if [ -n "$FLOOR" ] && ! lte "$FLOOR" "$VERSION"; then
+            decide below-floor "${VERSION} is older than ${FLOOR_KEY} ${FLOOR}; a content pin may not lag the module pin."; exit 0
+          fi
+          if [ -n "$MAX_VERSION" ] && ! lte "$VERSION" "$MAX_VERSION"; then
+            decide capped "${VERSION} is above the promotion cap ${MAX_VERSION}."; exit 0
+          fi
+
+          # Existing open bot PR: leave it alone (one at a time).
+          OPEN_PR="$(gh pr list --state open --head "$BRANCH_NAME" --json url --jq '.[0].url // empty')"
+          if [ -n "$OPEN_PR" ]; then
+            decide pr-open "A bump PR is already open: ${OPEN_PR}. It is left untouched; this version is picked up after it merges."; exit 0
+          fi
+
+          # Content-only check on the MIRROR: it holds exactly what the caller
+          # can deploy, so a change the mirror never receives cannot matter here.
+          git clone --quiet --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${MIRROR_REPOSITORY}.git" /tmp/mirror
+          RANGE="${CURRENT}..${VERSION}"
+          for tag in "$CURRENT" "$VERSION"; do
+            git -C /tmp/mirror rev-parse -q --verify "refs/tags/${tag}" >/dev/null \
+              || { echo "::error::${tag} is not a tag in ${MIRROR_REPOSITORY}"; exit 1; }
+          done
+          git -C /tmp/mirror diff --name-only --no-renames "$RANGE" > /tmp/changed-files.txt
+          echo "$(wc -l < /tmp/changed-files.txt | tr -d ' ') files changed in ${MIRROR_REPOSITORY} ${RANGE}"
+
+          : > /tmp/outside.txt
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            ok=false
+            while IFS= read -r prefix; do
+              [ -z "$prefix" ] && continue
+              case "$file" in "$prefix"*) ok=true; break ;; esac
+            done <<< "$CONTENT_ONLY_PATHS"
+            [ "$ok" = true ] || echo "$file" >> /tmp/outside.txt
+          done < /tmp/changed-files.txt
+
+          if [ -s /tmp/outside.txt ]; then
+            decide not-content-only "${MIRROR_REPOSITORY} ${RANGE} changes files outside the content paths; a person must open the usual ${FLOOR_KEY} PR." \
+              "" '~~~' "$(head -n 50 /tmp/outside.txt)" '~~~'
+            echo "::warning::${VERSION} is not content-only; not promoted."
+            exit 0
+          fi
+          decide promoted "Content-only release; opening PR."
+
+      - name: Import GPG signing key
+        if: steps.decide.outputs.result == 'promoted'
+        env:
+          GPG_KEY_BASE64: ${{ secrets.CI_BOT_GPG_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.CI_BOT_GPG_KEY_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.CI_BOT_GPG_KEY_ID }}
+          GPG_KEY_SUBJECT: ${{ secrets.CI_BOT_GPG_KEY_SUBJECT }}
+        run: |
+          if ! printf '%s\n' "$GPG_KEY_BASE64" | gpg --batch --yes --no-tty --always-trust --import; then
+            printf '%s\n' "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
+          fi
+          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient "$GPG_KEY_SUBJECT" > temp.encrypted
+          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
+          rm -f temp.encrypted
+          git config user.signingkey "$GPG_KEY_ID"
+          git config commit.gpgsign true
+          git config user.name "$COMMITTER_NAME"
+          git config user.email "$GPG_KEY_SUBJECT"
+
+      - name: Commit the bump
+        if: steps.decide.outputs.result == 'promoted'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          git checkout -B "$BRANCH_NAME" "origin/${DEFAULT_BRANCH}"
+          jq --indent 2 --arg k "$PIN_KEY" --arg v "$VERSION" '.[$k] = $v' "$PIN_FILE" > "${PIN_FILE}.tmp"
+          mv "${PIN_FILE}.tmp" "$PIN_FILE"
+          git add "$PIN_FILE"
+          git commit -m "${SUBJECT_PREFIX}: Bump ${PIN_KEY} to ${VERSION}"
+          # A stale branch from a closed PR may exist; the bump always starts from the default branch.
+          git push --force origin "$BRANCH_NAME"
+
+      - name: Open pull request
+        id: pr
+        if: steps.decide.outputs.result == 'promoted'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          CURRENT: ${{ steps.decide.outputs.current_version }}
+          FLOOR: ${{ steps.decide.outputs.floor_version }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+        run: |
+          RANGE="${CURRENT}...${VERSION}"
+          # The body is internal and read only when something needs debugging,
+          # so it carries pointers, not content: the compare link, the source
+          # release pages (which link on to the library releases and tickets)
+          # and this run. Best effort: nothing here may fail the step, since the
+          # branch is already pushed and a failure would leave it without a PR.
+          {
+            echo "## Summary"
+            echo
+            echo "Releases ${SOURCE_REPOSITORY#*/} **${VERSION}** here. Only \`${PIN_KEY}\` moves (${CURRENT} → ${VERSION}); the range changes nothing outside the content paths, so \`${FLOOR_KEY}\` stays at ${FLOOR:-unset}. Opened automatically; it merges when the required checks pass."
+            echo
+            echo "## Pointers"
+            echo
+            echo "- Compare: https://github.com/${SOURCE_REPOSITORY}/compare/${RANGE}"
+            RELEASES="$(git -C /tmp/mirror tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V \
+              | awk -v lo="$CURRENT" -v hi="$VERSION" '$0 == lo { f = 1; next } f { print } $0 == hi { exit }' \
+              | sed "s#.*#[&](https://github.com/${SOURCE_REPOSITORY}/releases/tag/&)#" | paste -sd ',' - | sed 's/,/, /g' || true)"
+            echo "- Releases: ${RELEASES:-unavailable}"
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/pr-body.md
+          PR_URL="$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH_NAME" \
+            --title "${SUBJECT_PREFIX}: Bump ${PIN_KEY} to ${VERSION}" --body-file /tmp/pr-body.md)"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "Opened ${PR_URL}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$AUTO_MERGE" = "true" ]; then
+            # Merges once every required check on the base branch passes.
+            if gh pr merge --auto --merge "$PR_URL"; then
+              echo "Auto-merge enabled." | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Could not enable auto-merge (is 'Allow auto-merge' on and are required checks configured?). PR left for a person."
+            fi
+          fi

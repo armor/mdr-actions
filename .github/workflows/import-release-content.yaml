@@ -1,8 +1,8 @@
 name: Import Release Content
 
-# Reusable content import: download a library release asset, strict-validate
-# every YAML file it adds or changes, and commit it with a version pointer
-# and changelog. The caller owns the triggers (repository_dispatch /
+# Reusable content import: download a library release asset, replace the
+# directories it carries, strict-validate every YAML file it adds or
+# changes, and commit it with a version pointer and changelog. The caller owns the triggers (repository_dispatch /
 # workflow_dispatch), concurrency group, and passes the requested version
 # through (empty = latest release).
 #
@@ -136,11 +136,27 @@ jobs:
       - name: Clean and extract content
         if: steps.release.outputs.skip != 'true'
         run: |
+          TARBALL="/tmp/${CONTENT_NAME}-release/${ARTIFACT_PATTERN}"
+
           # Clean untracked files in destination (matches AzDO git clean -ffd behavior)
           git clean -ffd -- "$DESTINATION"
 
-          # Extract into the destination (overwriting existing files)
-          tar xzf "/tmp/${CONTENT_NAME}-release/${ARTIFACT_PATTERN}" -C "$DESTINATION"
+          # Replace every top-level directory the asset carries. Extracting
+          # over tracked files never deletes, so a file retired upstream
+          # would otherwise keep deploying until removed by hand (TRU-390).
+          # Only directories the asset itself contains are touched; content
+          # maintained by hand in other directories is left alone.
+          tar tzf "$TARBALL" | sed -e 's#^\./##' | awk -F/ 'NF > 1 { print $1 }' | sort -u | while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            case "$entry" in
+              .|..|*/*) echo "::error::Refusing to replace unexpected asset entry '$entry'"; exit 1 ;;
+            esac
+            echo "Replacing ${DESTINATION}${entry}/"
+            rm -rf "${DESTINATION:?}${entry}"
+          done
+
+          # Extract into the destination
+          tar xzf "$TARBALL" -C "$DESTINATION"
 
       - name: Validate imported content
         if: steps.release.outputs.skip != 'true'

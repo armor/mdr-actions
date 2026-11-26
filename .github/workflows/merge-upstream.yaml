@@ -1,0 +1,288 @@
+name: Merge Upstream
+
+# Reusable downstream-sync step (TRU-390): merge the upstream repository's
+# default branch into the caller's, with the standard release commit
+# subject "Infrastructure-modules version <global_ref> & content
+# <xdr-content>" and no body (the subject is what the caller's release
+# notes are generated from), then either push the merge to the default
+# branch directly or open a pull request whose body carries debugging
+# pointers only.
+#
+# Two guards:
+# - direct_push applies only when the merge changes nothing but the
+#   direct_push_key in pin_file (a content version bump). Any other change
+#   from upstream, a template edit or a global_ref bump, always opens a
+#   pull request for a person, as today.
+# - Paths listed in exclude_paths are kept as they are in the caller
+#   ("ours"): upstream-only operational files never cross over, even into
+#   a pull request, and a modify/delete on them never counts as a conflict.
+# Any other conflict is committed with its markers and handed to a pull
+# request; validation fails until a person resolves it.
+
+on:
+  workflow_call:
+    inputs:
+      upstream_repository:
+        description: Repository merged from (org/name).
+        required: true
+        type: string
+      upstream_branch:
+        required: false
+        type: string
+        default: master
+      default_branch:
+        required: false
+        type: string
+        default: master
+      pin_file:
+        description: JSON file whose global_ref and xdr-content values name the release.
+        required: false
+        type: string
+        default: azure/.template/versions.json
+      modules_repository:
+        description: Repository whose compare link between the old and new xdr-content pins goes in the PR body.
+        required: false
+        type: string
+        default: armor/mdr-infrastructure-modules
+      exclude_paths:
+        description: Newline-separated paths kept as-is in the caller; never taken from upstream.
+        required: false
+        type: string
+        default: ''
+      direct_push:
+        description: Push the merge to the default branch when it is a pure pin bump. Otherwise open a pull request.
+        required: false
+        type: boolean
+        default: false
+      direct_push_key:
+        description: The only key in pin_file a merge may change to qualify for direct push.
+        required: false
+        type: string
+        default: xdr-content
+      committer_name:
+        required: false
+        type: string
+        default: armorsa
+    outputs:
+      result:
+        description: merged | pr-opened | not-pin-only-pr-opened | conflict-pr-opened | up-to-date (also when a sync PR is already open)
+        value: ${{ jobs.merge.outputs.result }}
+      pr_url:
+        value: ${{ jobs.merge.outputs.pr_url }}
+    secrets:
+      GIT_TOKEN_BASIC:
+        required: true
+      CI_BOT_GPG_KEY:
+        required: true
+      CI_BOT_GPG_KEY_ID:
+        required: true
+      CI_BOT_GPG_KEY_PASSPHRASE:
+        required: true
+      CI_BOT_GPG_KEY_SUBJECT:
+        required: true
+
+jobs:
+  merge:
+    name: Merge ${{ inputs.upstream_repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.finish.outputs.result || steps.merge.outputs.result || steps.upstream.outputs.result }}
+      pr_url: ${{ steps.finish.outputs.pr_url }}
+    env:
+      UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+      DEFAULT_BRANCH: ${{ inputs.default_branch }}
+      PIN_FILE: ${{ inputs.pin_file }}
+      MODULES_REPOSITORY: ${{ inputs.modules_repository }}
+      EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+      DIRECT_PUSH: ${{ inputs.direct_push }}
+      DIRECT_PUSH_KEY: ${{ inputs.direct_push_key }}
+      COMMITTER_NAME: ${{ inputs.committer_name }}
+      GH_TOKEN: ${{ secrets.GIT_TOKEN_BASIC }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.default_branch }}
+          token: ${{ secrets.GIT_TOKEN_BASIC }}
+          fetch-depth: 0
+
+      - name: Import GPG signing key
+        env:
+          GPG_KEY_BASE64: ${{ secrets.CI_BOT_GPG_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.CI_BOT_GPG_KEY_PASSPHRASE }}
+          GPG_KEY_ID: ${{ secrets.CI_BOT_GPG_KEY_ID }}
+          GPG_KEY_SUBJECT: ${{ secrets.CI_BOT_GPG_KEY_SUBJECT }}
+        run: |
+          if ! printf '%s\n' "$GPG_KEY_BASE64" | gpg --batch --yes --no-tty --always-trust --import; then
+            printf '%s\n' "$GPG_KEY_BASE64" | base64 -d | gpg --batch --yes --no-tty --always-trust --import
+          fi
+          echo "ENCRYPTION_TEST" | gpg --always-trust --encrypt --recipient "$GPG_KEY_SUBJECT" > temp.encrypted
+          gpg --batch --yes --no-tty --decrypt --passphrase "$GPG_PASSPHRASE" --pinentry-mode loopback --always-trust temp.encrypted
+          rm -f temp.encrypted
+          git config user.signingkey "$GPG_KEY_ID"
+          git config commit.gpgsign true
+          git config user.name "$COMMITTER_NAME"
+          git config user.email "$GPG_KEY_SUBJECT"
+
+      - name: Fetch upstream
+        id: upstream
+        run: |
+          git remote add upstream "https://x-access-token:${GH_TOKEN}@github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --quiet upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            { echo "up_to_date=true"; echo "result=up-to-date"; } >> "$GITHUB_OUTPUT"
+            echo "Already contains upstream/${UPSTREAM_BRANCH}; nothing to merge." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # One sync PR at a time, whoever opened it: a sync awaiting review is
+          # left alone; the next upstream push re-runs this workflow after it merges.
+          OPEN_PR="$(gh pr list --state open --search 'in:title "Infrastructure-modules version"' --json url --jq '.[0].url // empty')"
+          if [ -n "$OPEN_PR" ]; then
+            { echo "up_to_date=true"; echo "result=up-to-date"; } >> "$GITHUB_OUTPUT"
+            echo "A sync PR is already open and awaiting review: ${OPEN_PR}. Skipping until it is merged." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          pin() { git show "$1:${PIN_FILE}" | jq -r --arg k "$2" '.[$k] // empty'; }
+          {
+            echo "old_global_ref=$(pin HEAD global_ref)"
+            echo "old_xdr_content=$(pin HEAD xdr-content)"
+            echo "new_global_ref=$(pin "upstream/${UPSTREAM_BRANCH}" global_ref)"
+            echo "new_xdr_content=$(pin "upstream/${UPSTREAM_BRANCH}" xdr-content)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compose subject and pointers
+        id: notes
+        if: steps.upstream.outputs.up_to_date != 'true'
+        env:
+          OLD_GLOBAL_REF: ${{ steps.upstream.outputs.old_global_ref }}
+          NEW_GLOBAL_REF: ${{ steps.upstream.outputs.new_global_ref }}
+          OLD_XDR_CONTENT: ${{ steps.upstream.outputs.old_xdr_content }}
+          NEW_XDR_CONTENT: ${{ steps.upstream.outputs.new_xdr_content }}
+        run: |
+          SUBJECT="Infrastructure-modules version ${NEW_GLOBAL_REF} & content ${NEW_XDR_CONTENT}"
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+          # Pointers for a PR body, used only when a person has to look: the
+          # upstream range, the content range and this run. No prose; the
+          # commit itself carries the subject only.
+          {
+            echo "- Upstream: https://github.com/${UPSTREAM_REPOSITORY}/compare/$(git rev-parse --short HEAD)...$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
+            if [ -n "$OLD_XDR_CONTENT" ] && [ "$OLD_XDR_CONTENT" != "$NEW_XDR_CONTENT" ]; then
+              echo "- Content ${OLD_XDR_CONTENT} → ${NEW_XDR_CONTENT}: https://github.com/${MODULES_REPOSITORY}/compare/${OLD_XDR_CONTENT}...${NEW_XDR_CONTENT}"
+            fi
+            if [ "$OLD_GLOBAL_REF" != "$NEW_GLOBAL_REF" ]; then
+              echo "- Modules ${OLD_GLOBAL_REF} → ${NEW_GLOBAL_REF}: https://github.com/${MODULES_REPOSITORY}/compare/${OLD_GLOBAL_REF}...${NEW_GLOBAL_REF}"
+            fi
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > /tmp/pointers.md
+          cat /tmp/pointers.md
+
+      - name: Merge
+        id: merge
+        if: steps.upstream.outputs.up_to_date != 'true'
+        env:
+          SUBJECT: ${{ steps.notes.outputs.subject }}
+        run: |
+          set +e
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+          MERGE_STATUS=$?
+          set -e
+
+          # Excluded paths are always ours: restore what we have, drop what we do not.
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            if git cat-file -e "HEAD:${path}" 2>/dev/null; then
+              # restore, not checkout: also drops files upstream added under the path
+              git restore --source=HEAD --staged --worktree -- "$path"
+            else
+              git rm -r -q --cached --ignore-unmatch -- "$path"
+              rm -rf -- "$path"
+            fi
+          done <<< "$EXCLUDE_PATHS"
+
+          CONFLICTS="$(git diff --name-only --diff-filter=U)"
+          if [ -z "$CONFLICTS" ] && git diff --cached --quiet HEAD; then
+            # Everything upstream changed was in exclude_paths.
+            git merge --abort 2>/dev/null || git reset -q --hard HEAD
+            { echo "conflict=false"; echo "result=up-to-date"; } >> "$GITHUB_OUTPUT"
+            echo "Upstream changes are all in excluded paths; nothing to merge." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$MERGE_STATUS" -ne 0 ] && [ -n "$CONFLICTS" ]; then
+            # Commit the merge WITH the conflict markers, excluded paths already
+            # handled, and hand it to a person as a PR. The repo's pre-commit
+            # check fails on the markers, so the PR cannot merge until they are
+            # resolved on the branch. Pushing upstream's tip instead would let a
+            # plain merge of the PR carry the excluded paths over.
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Merge conflicts; committing them for a person to resolve in a pull request."
+            printf 'Conflicts:\n~~~\n%s\n~~~\n' "$CONFLICTS" | tee -a "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$CONFLICTS" > /tmp/conflicts.txt
+            git add -A
+            git commit --no-verify -m "$SUBJECT"
+            exit 0
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          git commit -m "$SUBJECT"
+
+          # Inclusion guard: only a merge that changes the pin key alone may be
+          # pushed without a person. Everything else is reviewed.
+          CHANGED="$(git diff --name-only --no-renames HEAD~1 HEAD)"
+          PIN_ONLY=false
+          if [ "$CHANGED" = "$PIN_FILE" ]; then
+            DIFF_KEYS="$(jq -r -n --argjson a "$(git show "HEAD~1:${PIN_FILE}")" --argjson b "$(git show "HEAD:${PIN_FILE}")" \
+              '[($a + $b | keys[]) | select($a[.] != $b[.])] | unique | .[]')"
+            [ "$DIFF_KEYS" = "$DIRECT_PUSH_KEY" ] && PIN_ONLY=true
+          fi
+          echo "pin_only=$PIN_ONLY" >> "$GITHUB_OUTPUT"
+          if [ "$PIN_ONLY" = true ]; then
+            echo "Merge changes only ${DIRECT_PUSH_KEY} in ${PIN_FILE}; eligible for direct push."
+          else
+            echo "Merge changes more than ${DIRECT_PUSH_KEY}; a person must review it:" | tee -a "$GITHUB_STEP_SUMMARY"
+            printf '%s\n' "$CHANGED" | head -n 50 | sed 's/^/- /' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Finish
+        id: finish
+        if: steps.upstream.outputs.up_to_date != 'true' && steps.merge.outputs.result != 'up-to-date'
+        env:
+          SUBJECT: ${{ steps.notes.outputs.subject }}
+          CONFLICT: ${{ steps.merge.outputs.conflict }}
+          PIN_ONLY: ${{ steps.merge.outputs.pin_only }}
+        run: |
+          if [ "$CONFLICT" != "true" ] && [ "$DIRECT_PUSH" = "true" ] && [ "$PIN_ONLY" = "true" ]; then
+            git push origin "HEAD:${DEFAULT_BRANCH}" \
+              || { echo "::error::Push to ${DEFAULT_BRANCH} rejected. Does the bot bypass the PR requirement, and has ${DEFAULT_BRANCH} moved? The next run re-merges."; exit 1; }
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            echo "Pushed '${SUBJECT}' to ${DEFAULT_BRANCH}." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BRANCH="feature-$(date -u +%Y-%m-%d-%H%M)"
+          if [ "$CONFLICT" = "true" ]; then
+            git checkout -b "$BRANCH"
+            git push origin "$BRANCH"
+            {
+              echo "Automatic merge of upstream/${UPSTREAM_BRANCH} hit conflicts. The merge commit on this branch contains the conflict markers; resolve them in a follow-up commit on this branch, then merge. Validation fails until the markers are gone."
+              echo
+              echo "Files with conflicts:"
+              sed 's/^/- /' /tmp/conflicts.txt
+              echo
+              cat /tmp/pointers.md
+            } > /tmp/pr-body.md
+            RESULT=conflict-pr-opened
+          else
+            git checkout -b "$BRANCH"
+            git push origin "$BRANCH"
+            cp /tmp/pointers.md /tmp/pr-body.md
+            RESULT=pr-opened
+            if [ "$DIRECT_PUSH" = "true" ] && [ "$PIN_ONLY" != "true" ]; then
+              RESULT=not-pin-only-pr-opened
+              printf '\nThis merge changes more than the %s pin, so it is not pushed automatically and needs a review.\n' "$DIRECT_PUSH_KEY" >> /tmp/pr-body.md
+            fi
+          fi
+          PR_URL="$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "$SUBJECT" --body-file /tmp/pr-body.md)"
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "Opened ${PR_URL} (${RESULT})." | tee -a "$GITHUB_STEP_SUMMARY"
