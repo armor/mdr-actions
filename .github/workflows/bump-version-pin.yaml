@@ -168,7 +168,7 @@ jobs:
 
           CURRENT="$(jq -r --arg k "$PIN_KEY" '.[$k] // empty' "$PIN_FILE")"
           FLOOR="$(jq -r --arg k "$FLOOR_KEY" '.[$k] // empty' "$PIN_FILE")"
-          echo "current_version=$CURRENT" >> "$GITHUB_OUTPUT"
+          { echo "current_version=$CURRENT"; echo "floor_version=$FLOOR"; } >> "$GITHUB_OUTPUT"
           echo "Current ${PIN_KEY}: ${CURRENT:-<unset>}   ${FLOOR_KEY}: ${FLOOR:-<unset>}"
 
           if [ -z "$CURRENT" ]; then
@@ -259,35 +259,44 @@ jobs:
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
           CURRENT: ${{ steps.decide.outputs.current_version }}
+          FLOOR: ${{ steps.decide.outputs.floor_version }}
           AUTO_MERGE: ${{ inputs.auto_merge }}
         run: |
           RANGE="${CURRENT}...${VERSION}"
+          # Body in the shape people write here: "## Summary" then "## What's in
+          # A -> B" with one bold line per source release naming the library
+          # version it imported, followed by that library release's own notes
+          # (semantic-release writes them with JIRA links). The mirror and the
+          # source share version numbers, so the mirror's tags give the list.
+          # Best effort: nothing here may fail the step, since the branch is
+          # already pushed and a failure would leave it without a PR.
+          tidy() { sed -e '/^[[:space:]]*$/d' -e '/^#/d' -e 's/^\* /- /' -e 's/ ([0-9a-f]\{40\})$//'; }
           {
-            echo "Release Notes:"
+            echo "## Summary"
             echo
-            # One entry per source release in the range, taken from its GitHub
-            # release body (semantic-release writes it with JIRA links). The mirror
-            # and the source share version numbers, so the mirror's tags give the
-            # list. Library imports are expanded with that library release's own
-            # notes so rule names survive. Notes are best effort: nothing here may
-            # fail the step, since the branch is already pushed and a failure
-            # would leave it without a PR.
+            echo "Releases ${SOURCE_REPOSITORY#*/} **${VERSION}** here. Only \`${PIN_KEY}\` moves (${CURRENT} → ${VERSION}); the range changes nothing outside the content paths, so \`${FLOOR_KEY}\` stays at ${FLOOR:-unset}. Opened automatically; it merges when the required checks pass."
+            echo
+            echo "## What's in ${CURRENT} → ${VERSION}"
+            echo
             git -C /tmp/mirror tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V \
               | awk -v lo="$CURRENT" -v hi="$VERSION" '$0 == lo { f = 1; next } f { print } $0 == hi { exit }' \
               | while IFS= read -r ver; do
-              echo "- ${SOURCE_REPOSITORY#*/} ${ver}"
               BODY="$(gh release view "$ver" --repo "$SOURCE_REPOSITORY" --json body --jq '.body' 2>/dev/null || true)"
-              if [ -z "$BODY" ]; then echo "    (release notes for ${SOURCE_REPOSITORY}@${ver} unavailable)"; continue; fi
-              printf '%s\n' "$BODY" | sed -e '/^[[:space:]]*$/d' -e '/^#/d' -e 's/^\* /- /' | while IFS= read -r line; do
-                echo "    ${line}"
+              if [ -z "$BODY" ]; then
+                printf '**%s**\n\n- (release notes for %s@%s unavailable)\n\n' "$ver" "$SOURCE_REPOSITORY" "$ver"; continue
+              fi
+              printf '%s\n' "$BODY" | tidy | while IFS= read -r line; do
                 if [[ "$line" =~ Import\ content\ updates\ from\ ([^@[:space:]]+)@([0-9]+\.[0-9]+\.[0-9]+) ]]; then
                   lib="${BASH_REMATCH[1]}"; lv="${BASH_REMATCH[2]}"
-                  gh release view "$lv" --repo "$lib" --json body --jq '.body' 2>/dev/null | sed -e '/^[[:space:]]*$/d' -e 's/^/        /' \
-                    || echo "        (release notes for ${lib}@${lv} unavailable)"
+                  printf '**%s, %s %s**\n\n' "$ver" "${lib#*/}" "$lv"
+                  gh release view "$lv" --repo "$lib" --json body --jq '.body' 2>/dev/null | tidy \
+                    || echo "- (release notes for ${lib}@${lv} unavailable)"
+                else
+                  printf '**%s**\n\n%s\n' "$ver" "$line"
                 fi
+                echo
               done
             done || echo "- (release list for ${CURRENT}..${VERSION} unavailable)"
-            echo
             echo "Compare: https://github.com/${SOURCE_REPOSITORY}/compare/${RANGE}"
           } > /tmp/pr-body.md
           PR_URL="$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH_NAME" \
